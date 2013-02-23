@@ -1,0 +1,167 @@
+#!/usr/bin/perl
+
+use v5.10;
+use strict;
+use warnings;
+
+my $has = sub {
+	my $caller = caller;
+	my ($attr, $default) = @_;
+	my $sub = sub { $_[0]{$attr} //= $default->() };
+	do { no strict 'refs'; *{"$caller\::$attr"} = $sub };
+};
+
+BEGIN {
+	package Daemon::Easy; $INC{'Daemon/Easy.pm'} = __FILE__;  # Fatpacked
+	use POSIX;
+	our $VERSION = '0.02';
+
+	sub import{
+		my $class       = shift;
+		my %args        = ( (@_ and ref($_[0])) ? %{$_[0]} : @_ ) or ();
+
+		$args{sleep} = 5 unless defined $args{sleep};
+		$args{pidfile} ||= "$0.pid";
+		$args{stopfile} ||= "$0.stop";
+		$args{callback} ||= 'worker';
+
+		no strict 'refs';
+		$args{worker} = \&{caller()."::$args{callback}"};
+		*{caller()."::run"} = sub{
+			unshift @_, \%args;
+			goto &_run;
+		};
+	}
+
+	sub _run{
+		my ($args,$cmd) = @_;
+		$cmd ||= $ARGV[0];
+		
+		$cmd = lc($cmd || '');
+		if( $cmd eq 'start' ){
+			if(my $status = status($args)){
+				print "the daemon is running with pid: $status\n";
+				exit;
+			}
+			start($args);
+		}elsif( $cmd eq 'stop' ){
+			stop($args);
+		}elsif( $cmd eq 'status' ){
+			if ( status($args) ){
+				print "the daemon is running with pid: ".status($args)."\n";
+			}else{
+				print "the daemon stopped\n";
+			}
+		}elsif( $cmd eq 'restart' ){
+			stop($args);
+			sleep(3) while(status($args));
+			start($args);
+		}else{
+			usage();
+		}
+	}
+
+	sub usage{
+		print "usage:\n\t $0 [start stop restart status]\n" ;
+		exit;
+	}
+
+	sub start{
+		my $args = shift;
+		my $pid = fork();
+		die "cant fork, $!\n" unless defined $pid;
+		
+		if($pid){ # parent, remember the child pid, and exit
+			open PID,">$args->{pidfile}" or die "cant open $args->{pidfile}, $!\n";
+			print PID $pid;
+			close PID;
+			exit(0);
+		}
+
+		POSIX::setsid();
+		
+		unlink ($args->{stopfile}) if( -e $args->{stopfile} );
+		
+		while(1){
+			eval { $args->{worker}->(); };
+			if($@){
+				print $@;
+				last;
+			}
+			sleep($args->{sleep}) if $args->{sleep};
+			if(-e $args->{stopfile} ){
+				unlink($args->{stopfile});
+				last;
+			}
+		}
+
+		unlink ($args->{pidfile});
+	}
+
+	sub stop{
+		my $args = shift;
+		open FH, ">$args->{stopfile}" or die "cant create $args->{stopfile}, $!\n";
+		close FH;
+	}
+
+	# check status, 0 if stoped, pid if running
+	sub status{
+		my $args = shift;
+		if(-e $args->{pidfile} ){
+			open PID,$args->{pidfile} or die "cant open $args->{pidfile}, $!\n";
+			my $pid=<PID>; chomp $pid;
+			close PID;
+			return $pid;
+		}else{
+			return 0;
+		}
+	}
+};
+
+{
+	package NetworkConnector;
+	
+	# Moose-like stuff
+	sub new { my $class = shift; bless {@_}, $class }
+	$has->(interface => sub { "wlan0" });
+	$has->(dhclient  => sub { "/sbin/dhclient" });
+	$has->(ifconfig  => sub { "/sbin/ifconfig" });
+	$has->(logfile   => sub { use autodie; open my $fh, ">>", "/var/log/NetworkConnector.log"; $fh });
+	
+	sub log {
+		my $self = shift;
+		say {$self->logfile} "[", ~~localtime, "] ", @_;
+	}
+	
+	sub connect {
+		my $self = shift;
+		$self->log("running dhclient");
+		system(sudo => $self->dhclient, "-1", $self->interface);
+	}
+	
+	sub is_connected {
+		my $self = shift;
+		my $cmd    = sprintf '%s %s', $self->ifconfig, $self->interface;
+		my $output = `$cmd`;
+		if ($output =~ /inet addr:(\S+)/) {
+			$self->log("is connected? yes - $1");
+			return 1;
+		}
+		$self->log("is connected? no");
+		return;
+	}	
+}
+
+use Daemon::Easy (
+	"sleep"    => 60,
+	"stopfile" => "/var/run/NetworkConnector.stopfiile",
+	"pidfile"  => "/var/run/NetworkConnector.pid",
+	"callback" => "worker",
+);
+
+sub worker {
+	state $nc = NetworkConnector->new;
+	$nc->connect unless $nc->is_connected
+}
+
+run();
